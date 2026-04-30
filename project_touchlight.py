@@ -11,7 +11,8 @@ Setup:
    System Settings -> Privacy & Security -> Accessibility
 4. Choose one of two startup modes:
    - Continuity Camera touchscreen mode: use your iPhone camera as a gesture-driven touchscreen.
-   - MacBook camera air-mouse mode: use the built-in camera to move the mouse with your finger and pinch to click.
+   - MacBook camera air-mouse mode: use the built-in camera to move the
+     mouse with your finger and pinch to click.
 5. For Continuity Camera, USB is preferred because it is typically lower latency than WiFi.
 6. Run:
    python project_touchlight.py
@@ -27,7 +28,10 @@ from __future__ import annotations
 import json
 import math
 import platform
+import subprocess
+import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import urllib.error
@@ -35,6 +39,9 @@ import urllib.request
 
 import cv2
 import mediapipe as mp
+from mediapipe.framework.formats import landmark_pb2
+from mediapipe.python.solutions import drawing_utils as mp_drawing
+from mediapipe.python.solutions import hands as mp_hands
 import pyautogui
 
 
@@ -51,7 +58,13 @@ HAND_LANDMARKER_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
     "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
 )
-HAND_LANDMARKER_MODEL_FILE = Path.home() / "Library" / "Caches" / "Project Touchlight" / "hand_landmarker.task"
+HAND_LANDMARKER_MODEL_FILE = (
+    Path.home()
+    / "Library"
+    / "Caches"
+    / "Project Touchlight"
+    / "hand_landmarker.task"
+)
 
 # Pinch threshold is measured in normalized image coordinates. Start slightly
 # conservative so accidental near-pinches do not click too often.
@@ -59,10 +72,20 @@ PINCH_DOWN_THRESHOLD = 0.040
 PINCH_UP_THRESHOLD = 0.060
 CLICK_DEBOUNCE_SECONDS = 0.45
 DRAG_HOLD_SECONDS = 0.20
+TAP_FAST_MOVE_THRESHOLD = 0.018
+TAP_STILL_THRESHOLD = 0.006
+TAP_MAX_DRIFT = 0.025
+TAP_SETTLE_SECONDS = 0.07
+TAP_DEBOUNCE_SECONDS = 0.35
 
 # Exponential moving average factor. Lower = smoother but slower.
 SMOOTHING_ALPHA = 0.18
 CAMERA_WARMUP_FRAMES = 20
+DEFAULT_CAMERA_SCAN_LIMIT = 10
+CONTINUITY_CAMERA_SCAN_LIMIT = 25
+CAMERA_PROBE_FRAMES = 20
+CAMERA_PROBE_DELAY_SECONDS = 0.03
+CAMERA_PREVIEW_TIMEOUT_SECONDS = 8.0
 ZOOM_DISTANCE_THRESHOLD = 0.012
 ZOOM_SCROLL_SCALE = 2200
 SCROLL_DELTA_THRESHOLD = 0.010
@@ -83,10 +106,17 @@ MODE_INFO = {
     },
     MODE_MACBOOK: {
         "label": "MacBook camera air-mouse",
-        "description": "Use your built-in camera to move the cursor with your finger and pinch to click.",
+        "description": (
+            "Use your built-in camera to move the cursor with your finger "
+            "and pinch to click."
+        ),
         "default_hint": "On macOS this is commonly camera index 0.",
     },
 }
+
+
+class CameraUnavailableError(RuntimeError):
+    """Raised when OpenCV cannot access any usable camera."""
 
 
 def calibration_file_for_mode(mode: str) -> Path:
@@ -104,20 +134,156 @@ def default_calibration() -> Dict[str, List[float]]:
     }
 
 
-def camera_backend() -> int:
-    """Use AVFoundation on macOS because it behaves better with Apple cameras."""
+def camera_backends() -> List[int]:
+    """Return camera backends to try, in preference order."""
     if platform.system() == "Darwin":
-        return cv2.CAP_AVFOUNDATION
-    return cv2.CAP_ANY
+        return [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
+    return [cv2.CAP_ANY]
+
+
+def configure_camera(capture: cv2.VideoCapture) -> None:
+    """Apply common capture settings."""
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, PROCESS_FRAME_WIDTH)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 
 def open_camera(index: int) -> cv2.VideoCapture:
     """Open a camera with a backend appropriate for the current platform."""
-    capture = cv2.VideoCapture(index, camera_backend())
-    capture.set(cv2.CAP_PROP_FRAME_WIDTH, PROCESS_FRAME_WIDTH)
-    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
-    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return capture
+    fallback = cv2.VideoCapture()
+    for backend in camera_backends():
+        capture = cv2.VideoCapture(index, backend)
+        configure_camera(capture)
+        if capture.isOpened():
+            return capture
+        capture.release()
+    return fallback
+
+
+def close_camera_window(capture: cv2.VideoCapture, *, all_windows: bool = False) -> None:
+    """Release a capture and close the OpenCV preview window."""
+    capture.release()
+    try:
+        if all_windows:
+            cv2.destroyAllWindows()
+        else:
+            cv2.destroyWindow(WINDOW_NAME)
+    except cv2.error:
+        pass
+
+
+def camera_scan_limit(mode: str) -> int:
+    """Continuity Camera can appear at higher indexes than built-in webcams."""
+    if mode == MODE_CONTINUITY:
+        return CONTINUITY_CAMERA_SCAN_LIMIT
+    return DEFAULT_CAMERA_SCAN_LIMIT
+
+
+def macos_camera_names() -> List[str]:
+    """Ask macOS which camera devices are currently visible."""
+    if platform.system() != "Darwin":
+        return []
+
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPCameraDataType"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    names: List[str] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line.endswith(":") or line == "Camera:":
+            continue
+        names.append(line[:-1])
+    return names
+
+
+def has_continuity_camera(names: List[str]) -> bool:
+    """Return whether the macOS camera list includes an iPhone/Continuity camera."""
+    return any(
+        "iphone" in name.lower() or "continuity" in name.lower()
+        for name in names
+    )
+
+
+def print_continuity_camera_hint(names: Optional[List[str]] = None) -> None:
+    """Print a targeted hint when macOS does not expose an iPhone camera."""
+    if names is None:
+        names = macos_camera_names()
+
+    if names:
+        print("macOS visible cameras:", ", ".join(names))
+    else:
+        print("macOS did not report any visible cameras.")
+
+    if not has_continuity_camera(names):
+        print("I do not see an iPhone/Continuity Camera in macOS right now.")
+        print("Check that the iPhone is nearby, unlocked, on the same Apple ID,")
+        print("and has Continuity Camera enabled in Settings -> General -> AirPlay & Continuity.")
+        print("Also grant Camera permission to Terminal/Python/Codex in macOS Privacy settings.")
+
+
+def open_continuity_camera_helper() -> None:
+    """Open FaceTime so macOS can wake/register Continuity Camera."""
+    if platform.system() != "Darwin":
+        print("Automatic Continuity Camera wake-up is only available on macOS.")
+        return
+
+    try:
+        subprocess.run(["open", "-a", "FaceTime"], check=False)
+    except OSError as exc:
+        print(f"Could not open FaceTime automatically: {exc}")
+        return
+
+    print(
+        "Opened FaceTime. If the iPhone camera appears there, select it, "
+        "then come back here and press r to rescan."
+    )
+
+
+def camera_returns_frames(capture: cv2.VideoCapture, attempts: int = CAMERA_PROBE_FRAMES) -> bool:
+    """Give slow virtual cameras a moment to start returning frames."""
+    for _ in range(attempts):
+        ok, frame = capture.read()
+        if ok and frame is not None:
+            return True
+        time.sleep(CAMERA_PROBE_DELAY_SECONDS)
+    return False
+
+
+def camera_index_returns_frames(index: int) -> bool:
+    """Probe all supported backends for a readable camera index."""
+    for backend in camera_backends():
+        capture = cv2.VideoCapture(index, backend)
+        configure_camera(capture)
+        if capture.isOpened() and camera_returns_frames(capture):
+            capture.release()
+            return True
+        capture.release()
+    return False
+
+
+def should_mirror_camera(mode: str) -> bool:
+    """
+    Mirror only the built-in camera mode.
+
+    Air-mouse control feels natural as a mirrored selfie preview, but a camera
+    aimed at the display should preserve left/right so touches map correctly.
+    """
+    return mode == MODE_MACBOOK
+
+
+def prepare_frame_for_tracking(frame, mode: str):
+    """Apply mode-specific camera orientation before preview/tracking."""
+    if should_mirror_camera(mode):
+        return cv2.flip(frame, 1)
+    return frame
 
 
 def choose_mode() -> str:
@@ -136,23 +302,55 @@ def choose_mode() -> str:
         print("Enter 1 or 2.")
 
 
-def choose_camera_index(mode: str, max_tested: int = 10) -> int:
+def choose_camera_index(mode: str, max_tested: Optional[int] = None) -> int:
     """Prompt the user to pick a camera after probing several indexes."""
-    print("Scanning camera indexes...")
+    visible_camera_names: List[str] = []
+    if max_tested is None:
+        max_tested = camera_scan_limit(mode)
+        if mode == MODE_CONTINUITY and platform.system() == "Darwin":
+            visible_camera_names = macos_camera_names()
+            if visible_camera_names and not has_continuity_camera(visible_camera_names):
+                max_tested = len(visible_camera_names)
+    elif mode == MODE_CONTINUITY and platform.system() == "Darwin":
+        visible_camera_names = macos_camera_names()
+
+    print(f"Scanning camera indexes 0-{max_tested - 1}...")
+    if mode == MODE_CONTINUITY:
+        print_continuity_camera_hint(visible_camera_names)
+
     available: List[int] = []
 
     for index in range(max_tested):
-        capture = open_camera(index)
-        if capture.isOpened():
-            for _ in range(5):
-                ok, _ = capture.read()
-                if ok:
-                    available.append(index)
-                    break
-        capture.release()
+        if camera_index_returns_frames(index):
+            available.append(index)
 
     if not available:
-        raise RuntimeError("No working cameras were found.")
+        if mode != MODE_CONTINUITY:
+            raise CameraUnavailableError(
+                "No working cameras were found. On macOS, grant Camera permission to "
+                "your terminal/Python app in System Settings -> Privacy & Security -> Camera, "
+                "then restart the app."
+            )
+
+        print("No cameras returned frames during the scan.")
+        print("Continuity Camera may still work if macOS exposes it after selection.")
+        while True:
+            raw_value = input(
+                "Enter an index to try, o to open FaceTime, r to rescan, "
+                "or q to quit [1]: "
+            ).strip()
+            if raw_value.lower() == "q":
+                raise SystemExit(0)
+            if raw_value.lower() == "o":
+                open_continuity_camera_helper()
+                continue
+            if raw_value.lower() == "r":
+                return choose_camera_index(mode)
+            if raw_value == "":
+                return 1
+            if raw_value.isdigit():
+                return int(raw_value)
+            print("Enter a camera index number, o to open FaceTime, r to rescan, or q to quit.")
 
     default_index = available[0]
     if platform.system() == "Darwin":
@@ -165,13 +363,37 @@ def choose_camera_index(mode: str, max_tested: int = 10) -> int:
     print(MODE_INFO[mode]["description"])
     print("Available camera indexes:", ", ".join(str(i) for i in available))
     print(MODE_INFO[mode]["default_hint"])
+    if (
+        mode == MODE_CONTINUITY
+        and visible_camera_names
+        and not has_continuity_camera(visible_camera_names)
+    ):
+        print("Only the built-in camera is exposed right now.")
+        print(
+            "Press o to open FaceTime, choose the iPhone camera there "
+            "if it appears, then press r here."
+        )
     print(f"Default camera index: {default_index}")
 
     while True:
-        raw_value = input(f"Choose camera index [{default_index}]: ").strip()
+        if mode == MODE_CONTINUITY:
+            raw_value = input(
+                f"Choose camera index [{default_index}], "
+                "o to open FaceTime, r to rescan: "
+            ).strip()
+        else:
+            raw_value = input(f"Choose camera index [{default_index}]: ").strip()
         if not raw_value:
             return default_index
+        if raw_value.lower() == "o" and mode == MODE_CONTINUITY:
+            open_continuity_camera_helper()
+            continue
+        if raw_value.lower() == "r" and mode == MODE_CONTINUITY:
+            return choose_camera_index(mode)
         if raw_value.isdigit() and int(raw_value) in available:
+            return int(raw_value)
+        if raw_value.isdigit() and mode == MODE_CONTINUITY:
+            print(f"Trying undetected Continuity Camera index {raw_value}.")
             return int(raw_value)
         print("Please enter one of the detected camera indexes.")
 
@@ -191,14 +413,20 @@ def confirm_camera_selection(mode: str, camera_index: int) -> bool:
     for _ in range(CAMERA_WARMUP_FRAMES):
         ok, _ = capture.read()
         if not ok:
-            break
+            time.sleep(CAMERA_PROBE_DELAY_SECONDS)
 
+    preview_started_time = time.time()
     while True:
         ok, frame = capture.read()
         if not ok:
+            if (time.time() - preview_started_time) > CAMERA_PREVIEW_TIMEOUT_SECONDS:
+                print(f"Camera index {camera_index} opened but did not return preview frames.")
+                close_camera_window(capture)
+                return False
+            time.sleep(CAMERA_PROBE_DELAY_SECONDS)
             continue
 
-        frame = cv2.flip(frame, 1)
+        frame = prepare_frame_for_tracking(frame, mode)
         draw_instruction(frame, f"Preview: {MODE_INFO[mode]['label']}")
         draw_instruction(frame, f"Camera index: {camera_index}", 1)
         draw_instruction(frame, "Press y to use this camera, n to choose another, q to quit", 2)
@@ -206,16 +434,13 @@ def confirm_camera_selection(mode: str, camera_index: int) -> bool:
         key = cv2.waitKey(1) & 0xFF
 
         if key == ord("y"):
-            capture.release()
-            cv2.destroyWindow(WINDOW_NAME)
+            close_camera_window(capture)
             return True
         if key == ord("n"):
-            capture.release()
-            cv2.destroyWindow(WINDOW_NAME)
+            close_camera_window(capture)
             return False
         if key == ord("q"):
-            capture.release()
-            cv2.destroyAllWindows()
+            close_camera_window(capture, all_windows=True)
             raise SystemExit(0)
 
 
@@ -297,10 +522,19 @@ def draw_instruction(frame, text: str, line: int = 0) -> None:
     )
 
 
+def draw_hand_landmarks(frame, hand_landmarks) -> None:
+    """Draw Tasks API hand landmarks with MediaPipe's classic drawing helper."""
+    landmark_list = landmark_pb2.NormalizedLandmarkList()
+    landmark_list.landmark.extend(
+        landmark_pb2.NormalizedLandmark(x=landmark.x, y=landmark.y, z=getattr(landmark, "z", 0.0))
+        for landmark in hand_landmarks
+    )
+    mp_drawing.draw_landmarks(frame, landmark_list, mp_hands.HAND_CONNECTIONS)
+
+
 def calibrate_gesture_zone(
     capture: cv2.VideoCapture,
     landmarker: mp.tasks.vision.HandLandmarker,
-    drawer: mp.tasks.vision.drawing_utils,
     calibration_file: Path,
     mode: str,
     start_timestamp_ms: int,
@@ -324,7 +558,7 @@ def calibrate_gesture_zone(
         if not ok:
             continue
 
-        frame = cv2.flip(frame, 1)
+        frame = prepare_frame_for_tracking(frame, mode)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         timestamp_ms += 1
@@ -333,11 +567,7 @@ def calibrate_gesture_zone(
         index_tip: Optional[Tuple[float, float]] = None
         if result.hand_landmarks:
             hand_landmarks = result.hand_landmarks[0]
-            drawer.draw_landmarks(
-                frame,
-                hand_landmarks,
-                mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS,
-            )
+            draw_hand_landmarks(frame, hand_landmarks)
             index_landmark = hand_landmarks[8]
             index_tip = (index_landmark.x, index_landmark.y)
 
@@ -377,7 +607,6 @@ def calibrate_gesture_zone(
 def run_calibration_safely(
     capture: cv2.VideoCapture,
     landmarker: mp.tasks.vision.HandLandmarker,
-    drawer: mp.tasks.vision.drawing_utils,
     calibration_file: Path,
     mode: str,
     start_timestamp_ms: int,
@@ -387,13 +616,13 @@ def run_calibration_safely(
         return calibrate_gesture_zone(
             capture,
             landmarker,
-            drawer,
             calibration_file,
             mode,
             start_timestamp_ms,
         )
     except Exception as exc:
         print(f"Calibration failed: {exc}")
+        traceback.print_exc()
         return None, start_timestamp_ms
 
 
@@ -435,7 +664,11 @@ def map_to_screen(
     return screen_x, screen_y
 
 
-def ema(previous: Optional[Tuple[float, float]], current: Tuple[float, float], alpha: float) -> Tuple[float, float]:
+def ema(
+    previous: Optional[Tuple[float, float]],
+    current: Tuple[float, float],
+    alpha: float,
+) -> Tuple[float, float]:
     """Smooth cursor motion with an exponential moving average."""
     if previous is None:
         return current
@@ -481,6 +714,51 @@ def pinch_is_active(distance: float, was_active: bool) -> bool:
     return distance < PINCH_DOWN_THRESHOLD
 
 
+def detect_index_tap(
+    current_point: Tuple[float, float],
+    previous_point: Optional[Tuple[float, float]],
+    candidate_point: Optional[Tuple[float, float]],
+    candidate_started_time: Optional[float],
+    last_tap_time: float,
+    now: float,
+) -> Tuple[bool, Optional[Tuple[float, float]], Optional[float]]:
+    """
+    Detect a screen-tap-like gesture from fingertip motion.
+
+    A tap is treated as a quick move into position followed by a short, steady
+    settle at nearly the same point. This works with ordinary 2D hand landmarks,
+    where real touch depth is not reliable enough to use by itself.
+    """
+    if previous_point is None:
+        return False, None, None
+
+    movement = math.hypot(
+        current_point[0] - previous_point[0],
+        current_point[1] - previous_point[1],
+    )
+
+    if movement >= TAP_FAST_MOVE_THRESHOLD:
+        return False, current_point, now
+
+    if candidate_point is None or candidate_started_time is None:
+        return False, None, None
+
+    drift = math.hypot(
+        current_point[0] - candidate_point[0],
+        current_point[1] - candidate_point[1],
+    )
+    if drift > TAP_MAX_DRIFT:
+        return False, None, None
+
+    settled = movement <= TAP_STILL_THRESHOLD
+    old_enough = (now - candidate_started_time) >= TAP_SETTLE_SECONDS
+    debounced = (now - last_tap_time) >= TAP_DEBOUNCE_SECONDS
+    if settled and old_enough and debounced:
+        return True, None, None
+
+    return False, candidate_point, candidate_started_time
+
+
 def perform_zoom_scroll(amount: int) -> None:
     """Zoom by pairing a scroll event with the macOS Command modifier."""
     if amount == 0:
@@ -495,6 +773,7 @@ def perform_zoom_scroll(amount: int) -> None:
 def main() -> None:
     mode = choose_mode()
     calibration_file = calibration_file_for_mode(mode)
+
     while True:
         camera_index = choose_camera_index(mode)
         if confirm_camera_selection(mode, camera_index):
@@ -517,7 +796,6 @@ def main() -> None:
     model_path = ensure_hand_landmarker_model()
     mp_vision = mp.tasks.vision
     mp_base = mp.tasks.BaseOptions
-    mp_draw = mp_vision.drawing_utils
 
     smoothed_cursor: Optional[Tuple[float, float]] = None
     last_sent_cursor: Optional[Tuple[float, float]] = None
@@ -532,6 +810,10 @@ def main() -> None:
     last_mission_control_time = 0.0
     pinch_started_time: Optional[float] = None
     mouse_dragging = False
+    previous_index_point: Optional[Tuple[float, float]] = None
+    tap_candidate_point: Optional[Tuple[float, float]] = None
+    tap_candidate_started_time: Optional[float] = None
+    last_tap_time = 0.0
 
     hand_landmarker_options = mp_vision.HandLandmarkerOptions(
         base_options=mp_base(model_asset_path=str(model_path)),
@@ -542,297 +824,384 @@ def main() -> None:
         min_tracking_confidence=0.6,
     )
 
-    with mp_vision.HandLandmarker.create_from_options(hand_landmarker_options) as landmarker:
-        if calibration is None:
-            calibration, timestamp_ms = run_calibration_safely(
-                capture,
-                landmarker,
-                mp_draw,
-                calibration_file,
-                mode,
-                timestamp_ms,
-            )
+    try:
+        with mp_vision.HandLandmarker.create_from_options(hand_landmarker_options) as landmarker:
             if calibration is None:
-                calibration = default_calibration()
-                print("Calibration skipped. Using full-frame fallback mapping until you calibrate with 'c'.")
-
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                continue
-
-            # Flip horizontally so movement feels mirror-like in the preview.
-            frame = cv2.flip(frame, 1)
-            debug_frame = frame.copy()
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-            timestamp_ms += 1
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
-
-            mapped_cursor: Optional[Tuple[float, float]] = None
-            pinch_now = False
-            gesture_status = "None"
-            gesture_override_active = False
-
-            if result.hand_landmarks:
-                hand_landmarks = result.hand_landmarks[0]
-                mp_draw.draw_landmarks(
-                    debug_frame,
-                    hand_landmarks,
-                    mp_vision.HandLandmarksConnections.HAND_CONNECTIONS,
+                calibration, timestamp_ms = run_calibration_safely(
+                    capture,
+                    landmarker,
+                    calibration_file,
+                    mode,
+                    timestamp_ms,
                 )
-
-                index_tip = hand_landmarks[8]
-                thumb_tip = hand_landmarks[4]
-                finger_state = extended_finger_state(hand_landmarks)
-
-                if mode == MODE_MACBOOK:
-                    two_finger_mode = (
-                        finger_state["index"]
-                        and finger_state["middle"]
-                        and not finger_state["ring"]
-                        and not finger_state["pinky"]
+                if calibration is None:
+                    calibration = default_calibration()
+                    print(
+                        "Calibration skipped. Using full-frame fallback mapping "
+                        "until you calibrate with 'c'."
                     )
-                    four_finger_mode = all(finger_state.values())
 
-                    if four_finger_mode:
-                        four_finger_points = [
-                            (hand_landmarks[8].x, hand_landmarks[8].y),
-                            (hand_landmarks[12].x, hand_landmarks[12].y),
-                            (hand_landmarks[16].x, hand_landmarks[16].y),
-                            (hand_landmarks[20].x, hand_landmarks[20].y),
-                        ]
-                        current_center = average_point(four_finger_points)
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    continue
 
-                        if four_finger_previous_center is not None:
-                            delta_x = current_center[0] - four_finger_previous_center[0]
-                            delta_y = four_finger_previous_center[1] - current_center[1]
-                            ready = (time.time() - last_mission_control_time) > MISSION_CONTROL_COOLDOWN_SECONDS
-                            four_finger_accumulated_dx += delta_x
-                            four_finger_accumulated_dy += delta_y
+                frame = prepare_frame_for_tracking(frame, mode)
+                debug_frame = frame.copy()
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                timestamp_ms += 1
+                result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+                mapped_cursor: Optional[Tuple[float, float]] = None
+                pinch_now = False
+                gesture_status = "None"
+                gesture_override_active = False
+
+                if result.hand_landmarks:
+                    hand_landmarks = result.hand_landmarks[0]
+                    draw_hand_landmarks(debug_frame, hand_landmarks)
+
+                    index_tip = hand_landmarks[8]
+                    thumb_tip = hand_landmarks[4]
+                    finger_state = extended_finger_state(hand_landmarks)
+
+                    if mode == MODE_MACBOOK:
+                        two_finger_mode = (
+                            finger_state["index"]
+                            and finger_state["middle"]
+                            and not finger_state["ring"]
+                            and not finger_state["pinky"]
+                        )
+                        four_finger_mode = all(finger_state.values())
+
+                        if four_finger_mode:
+                            four_finger_points = [
+                                (hand_landmarks[8].x, hand_landmarks[8].y),
+                                (hand_landmarks[12].x, hand_landmarks[12].y),
+                                (hand_landmarks[16].x, hand_landmarks[16].y),
+                                (hand_landmarks[20].x, hand_landmarks[20].y),
+                            ]
+                            current_center = average_point(four_finger_points)
+
+                            if four_finger_previous_center is not None:
+                                delta_x = current_center[0] - four_finger_previous_center[0]
+                                delta_y = four_finger_previous_center[1] - current_center[1]
+                                ready = (
+                                    time.time() - last_mission_control_time
+                                ) > MISSION_CONTROL_COOLDOWN_SECONDS
+                                four_finger_accumulated_dx += delta_x
+                                four_finger_accumulated_dy += delta_y
+
+                                if (
+                                    ready
+                                    and abs(four_finger_accumulated_dx) > DESKTOP_SWIPE_THRESHOLD
+                                    and abs(four_finger_accumulated_dx)
+                                    > abs(four_finger_accumulated_dy)
+                                ):
+                                    if four_finger_accumulated_dx > 0:
+                                        pyautogui.hotkey("ctrl", "right")
+                                        gesture_status = "Next desktop"
+                                    else:
+                                        pyautogui.hotkey("ctrl", "left")
+                                        gesture_status = "Previous desktop"
+                                    last_mission_control_time = time.time()
+                                    four_finger_accumulated_dx = 0.0
+                                    four_finger_accumulated_dy = 0.0
+                                elif (
+                                    ready
+                                    and four_finger_accumulated_dy
+                                    > MISSION_CONTROL_SWIPE_THRESHOLD
+                                ):
+                                    pyautogui.hotkey("ctrl", "up")
+                                    last_mission_control_time = time.time()
+                                    gesture_status = "Mission Control"
+                                    four_finger_accumulated_dx = 0.0
+                                    four_finger_accumulated_dy = 0.0
+                            four_finger_previous_center = current_center
+                            two_finger_previous_center = None
+                            two_finger_previous_distance = None
+                            gesture_override_active = True
+                            smoothed_cursor = None
+                        elif two_finger_mode:
+                            two_finger_points = [
+                                (hand_landmarks[8].x, hand_landmarks[8].y),
+                                (hand_landmarks[12].x, hand_landmarks[12].y),
+                            ]
+                            two_finger_center = average_point(two_finger_points)
+                            two_finger_distance = normalized_distance(
+                                hand_landmarks[8],
+                                hand_landmarks[12],
+                            )
 
                             if (
-                                ready
-                                and abs(four_finger_accumulated_dx) > DESKTOP_SWIPE_THRESHOLD
-                                and abs(four_finger_accumulated_dx) > abs(four_finger_accumulated_dy)
+                                two_finger_previous_center is not None
+                                and two_finger_previous_distance is not None
                             ):
-                                if four_finger_accumulated_dx > 0:
-                                    pyautogui.hotkey("ctrl", "right")
-                                    gesture_status = "Next desktop"
+                                delta_x = two_finger_center[0] - two_finger_previous_center[0]
+                                delta_y = two_finger_previous_center[1] - two_finger_center[1]
+                                delta_distance = two_finger_distance - two_finger_previous_distance
+
+                                if (
+                                    abs(delta_distance) > ZOOM_DISTANCE_THRESHOLD
+                                    and abs(delta_distance) > abs(delta_y)
+                                ):
+                                    zoom_scroll = int(delta_distance * ZOOM_SCROLL_SCALE)
+                                    if zoom_scroll != 0:
+                                        perform_zoom_scroll(zoom_scroll)
+                                        gesture_status = "Two-finger zoom"
                                 else:
-                                    pyautogui.hotkey("ctrl", "left")
-                                    gesture_status = "Previous desktop"
-                                last_mission_control_time = time.time()
-                                four_finger_accumulated_dx = 0.0
-                                four_finger_accumulated_dy = 0.0
-                            elif ready and four_finger_accumulated_dy > MISSION_CONTROL_SWIPE_THRESHOLD:
-                                pyautogui.hotkey("ctrl", "up")
-                                last_mission_control_time = time.time()
-                                gesture_status = "Mission Control"
-                                four_finger_accumulated_dx = 0.0
-                                four_finger_accumulated_dy = 0.0
-                        four_finger_previous_center = current_center
-                        two_finger_previous_center = None
-                        two_finger_previous_distance = None
-                        gesture_override_active = True
-                        smoothed_cursor = None
-                    elif two_finger_mode:
-                        two_finger_points = [
-                            (hand_landmarks[8].x, hand_landmarks[8].y),
-                            (hand_landmarks[12].x, hand_landmarks[12].y),
-                        ]
-                        two_finger_center = average_point(two_finger_points)
-                        two_finger_distance = normalized_distance(hand_landmarks[8], hand_landmarks[12])
+                                    if abs(delta_y) > SCROLL_DELTA_THRESHOLD:
+                                        pyautogui.scroll(int(delta_y * SCROLL_SCALE))
+                                        gesture_status = "Two-finger vertical scroll"
+                                    if abs(delta_x) > SCROLL_DELTA_THRESHOLD:
+                                        pyautogui.hscroll(int(delta_x * SCROLL_SCALE))
+                                        gesture_status = "Two-finger horizontal scroll"
 
-                        if two_finger_previous_center is not None and two_finger_previous_distance is not None:
-                            delta_x = two_finger_center[0] - two_finger_previous_center[0]
-                            delta_y = two_finger_previous_center[1] - two_finger_center[1]
-                            delta_distance = two_finger_distance - two_finger_previous_distance
+                            two_finger_previous_center = two_finger_center
+                            two_finger_previous_distance = two_finger_distance
+                            four_finger_previous_center = None
+                            four_finger_accumulated_dx = 0.0
+                            four_finger_accumulated_dy = 0.0
+                            gesture_override_active = True
+                            smoothed_cursor = None
+                        else:
+                            two_finger_previous_center = None
+                            two_finger_previous_distance = None
+                            four_finger_previous_center = None
+                            four_finger_accumulated_dx = 0.0
+                            four_finger_accumulated_dy = 0.0
+                            last_sent_cursor = None
 
-                            if abs(delta_distance) > ZOOM_DISTANCE_THRESHOLD and abs(delta_distance) > abs(delta_y):
-                                zoom_scroll = int(delta_distance * ZOOM_SCROLL_SCALE)
-                                if zoom_scroll != 0:
-                                    perform_zoom_scroll(zoom_scroll)
-                                    gesture_status = "Two-finger zoom"
+                    if not gesture_override_active:
+                        index_point = (index_tip.x, index_tip.y)
+                        mapped_cursor = map_to_screen(
+                            index_point,
+                            calibration,
+                            screen_width,
+                            screen_height,
+                        )
+                        smoothed_cursor = ema(smoothed_cursor, mapped_cursor, SMOOTHING_ALPHA)
+                        if (
+                            last_sent_cursor is None
+                            or math.hypot(
+                                smoothed_cursor[0] - last_sent_cursor[0],
+                                smoothed_cursor[1] - last_sent_cursor[1],
+                            ) >= CURSOR_MOVE_DEADZONE_PX
+                        ):
+                            pyautogui.moveTo(
+                                smoothed_cursor[0],
+                                smoothed_cursor[1],
+                                _pause=False,
+                            )
+                            last_sent_cursor = smoothed_cursor
+
+                        now = time.time()
+                        if mode == MODE_CONTINUITY:
+                            (
+                                tapped,
+                                tap_candidate_point,
+                                tap_candidate_started_time,
+                            ) = detect_index_tap(
+                                index_point,
+                                previous_index_point,
+                                tap_candidate_point,
+                                tap_candidate_started_time,
+                                last_tap_time,
+                                now,
+                            )
+                            if tapped:
+                                pyautogui.click()
+                                last_tap_time = now
+                                gesture_status = "Tap click"
+                            elif tap_candidate_point is not None:
+                                gesture_status = "Tap target"
                             else:
-                                if abs(delta_y) > SCROLL_DELTA_THRESHOLD:
-                                    pyautogui.scroll(int(delta_y * SCROLL_SCALE))
-                                    gesture_status = "Two-finger vertical scroll"
-                                if abs(delta_x) > SCROLL_DELTA_THRESHOLD:
-                                    pyautogui.hscroll(int(delta_x * SCROLL_SCALE))
-                                    gesture_status = "Two-finger horizontal scroll"
+                                gesture_status = "Cursor control"
 
-                        two_finger_previous_center = two_finger_center
-                        two_finger_previous_distance = two_finger_distance
-                        four_finger_previous_center = None
-                        four_finger_accumulated_dx = 0.0
-                        four_finger_accumulated_dy = 0.0
-                        gesture_override_active = True
-                        smoothed_cursor = None
+                            pinch_active = False
+                            pinch_started_time = None
+                            if mouse_dragging:
+                                pyautogui.mouseUp()
+                                mouse_dragging = False
+                        else:
+                            pinch_distance = normalized_distance(index_tip, thumb_tip)
+                            pinch_now = pinch_is_active(pinch_distance, pinch_active)
+
+                            if pinch_now and not pinch_active:
+                                pinch_started_time = now
+
+                            if pinch_now and pinch_started_time is not None:
+                                pinch_elapsed = time.time() - pinch_started_time
+                                if not mouse_dragging and pinch_elapsed >= DRAG_HOLD_SECONDS:
+                                    pyautogui.mouseDown()
+                                    mouse_dragging = True
+                                    gesture_status = "Pinch drag"
+
+                            if not pinch_now and pinch_active:
+                                pinch_elapsed = 0.0
+                                if pinch_started_time is not None:
+                                    pinch_elapsed = now - pinch_started_time
+
+                                if mouse_dragging:
+                                    pyautogui.mouseUp()
+                                    mouse_dragging = False
+                                    gesture_status = "Drop"
+                                elif (
+                                    pinch_elapsed < DRAG_HOLD_SECONDS
+                                    and (now - last_click_time) > CLICK_DEBOUNCE_SECONDS
+                                ):
+                                    pyautogui.click()
+                                    last_click_time = now
+                                    gesture_status = "Pinch click"
+                                pinch_started_time = None
+
+                            pinch_active = pinch_now
+                            if pinch_now:
+                                if mouse_dragging:
+                                    gesture_status = "Pinch drag"
+                                elif (
+                                    pinch_started_time is not None
+                                    and (now - pinch_started_time) < DRAG_HOLD_SECONDS
+                                ):
+                                    gesture_status = "Pinch hold"
+                            elif gesture_status == "None":
+                                gesture_status = "Cursor control"
+                            tap_candidate_point = None
+                            tap_candidate_started_time = None
+
+                        previous_index_point = index_point
                     else:
-                        two_finger_previous_center = None
-                        two_finger_previous_distance = None
-                        four_finger_previous_center = None
-                        four_finger_accumulated_dx = 0.0
-                        four_finger_accumulated_dy = 0.0
-                        last_sent_cursor = None
-
-                if not gesture_override_active:
-                    mapped_cursor = map_to_screen(
-                        (index_tip.x, index_tip.y),
-                        calibration,
-                        screen_width,
-                        screen_height,
-                    )
-                    smoothed_cursor = ema(smoothed_cursor, mapped_cursor, SMOOTHING_ALPHA)
-                    if (
-                        last_sent_cursor is None
-                        or math.hypot(
-                            smoothed_cursor[0] - last_sent_cursor[0],
-                            smoothed_cursor[1] - last_sent_cursor[1],
-                        ) >= CURSOR_MOVE_DEADZONE_PX
-                    ):
-                        pyautogui.moveTo(smoothed_cursor[0], smoothed_cursor[1], _pause=False)
-                        last_sent_cursor = smoothed_cursor
-
-                    pinch_distance = normalized_distance(index_tip, thumb_tip)
-                    pinch_now = pinch_is_active(pinch_distance, pinch_active)
-
-                    if pinch_now and not pinch_active:
-                        pinch_started_time = time.time()
-
-                    if pinch_now and pinch_started_time is not None:
-                        pinch_elapsed = time.time() - pinch_started_time
-                        if not mouse_dragging and pinch_elapsed >= DRAG_HOLD_SECONDS:
-                            pyautogui.mouseDown()
-                            mouse_dragging = True
-                            gesture_status = "Pinch drag"
-
-                    if not pinch_now and pinch_active:
-                        pinch_elapsed = 0.0
-                        if pinch_started_time is not None:
-                            pinch_elapsed = time.time() - pinch_started_time
-
                         if mouse_dragging:
                             pyautogui.mouseUp()
                             mouse_dragging = False
-                            gesture_status = "Drop"
-                        elif pinch_elapsed < DRAG_HOLD_SECONDS and (time.time() - last_click_time) > CLICK_DEBOUNCE_SECONDS:
-                            pyautogui.click()
-                            last_click_time = time.time()
-                            gesture_status = "Pinch click"
+                        pinch_active = False
                         pinch_started_time = None
+                        last_sent_cursor = None
+                        previous_index_point = None
+                        tap_candidate_point = None
+                        tap_candidate_started_time = None
 
-                    pinch_active = pinch_now
-                    if pinch_now:
-                        if mouse_dragging:
-                            gesture_status = "Pinch drag"
-                        elif pinch_started_time is not None and (time.time() - pinch_started_time) < DRAG_HOLD_SECONDS:
-                            gesture_status = "Pinch hold"
-                    elif gesture_status == "None":
-                        gesture_status = "Cursor control"
+                    h, w = debug_frame.shape[:2]
+                    index_px = (int(index_tip.x * w), int(index_tip.y * h))
+                    thumb_px = (int(thumb_tip.x * w), int(thumb_tip.y * h))
+                    cv2.circle(debug_frame, index_px, 9, (0, 255, 0), -1)
+                    cv2.circle(debug_frame, thumb_px, 9, (255, 0, 0), -1)
+                    cv2.line(debug_frame, index_px, thumb_px, (255, 255, 0), 2)
+
+                    min_x, max_x, min_y, max_y = calibration_bounds(calibration)
+                    zone_start = (int(min_x * w), int(min_y * h))
+                    zone_end = (int(max_x * w), int(max_y * h))
+                    cv2.rectangle(debug_frame, zone_start, zone_end, (0, 200, 255), 2)
                 else:
                     if mouse_dragging:
                         pyautogui.mouseUp()
                         mouse_dragging = False
                     pinch_active = False
                     pinch_started_time = None
+                    two_finger_previous_center = None
+                    two_finger_previous_distance = None
+                    four_finger_previous_center = None
+                    four_finger_accumulated_dx = 0.0
+                    four_finger_accumulated_dy = 0.0
                     last_sent_cursor = None
+                    previous_index_point = None
+                    tap_candidate_point = None
+                    tap_candidate_started_time = None
 
-                h, w = debug_frame.shape[:2]
-                index_px = (int(index_tip.x * w), int(index_tip.y * h))
-                thumb_px = (int(thumb_tip.x * w), int(thumb_tip.y * h))
-                cv2.circle(debug_frame, index_px, 9, (0, 255, 0), -1)
-                cv2.circle(debug_frame, thumb_px, 9, (255, 0, 0), -1)
-                cv2.line(debug_frame, index_px, thumb_px, (255, 255, 0), 2)
-
-                min_x, max_x, min_y, max_y = calibration_bounds(calibration)
-                zone_start = (int(min_x * w), int(min_y * h))
-                zone_end = (int(max_x * w), int(max_y * h))
-                cv2.rectangle(debug_frame, zone_start, zone_end, (0, 200, 255), 2)
-            else:
-                if mouse_dragging:
-                    pyautogui.mouseUp()
-                    mouse_dragging = False
-                pinch_active = False
-                pinch_started_time = None
-                two_finger_previous_center = None
-                two_finger_previous_distance = None
-                four_finger_previous_center = None
-                four_finger_accumulated_dx = 0.0
-                four_finger_accumulated_dy = 0.0
-                last_sent_cursor = None
-
-            draw_instruction(debug_frame, "Project Touchlight")
-            draw_instruction(debug_frame, "Keys: c = calibrate, r = reset calibration, q = quit", 1)
-            draw_instruction(debug_frame, f"Mode: {MODE_INFO[mode]['label']} | Camera: {camera_index}", 2)
-            draw_instruction(
-                debug_frame,
-                f"Pinch: {'ON' if pinch_now else 'OFF'} | Drag: {'ON' if mouse_dragging else 'OFF'} | Gesture: {gesture_status}",
-                3,
-            )
-
-            if smoothed_cursor is not None:
+                draw_instruction(debug_frame, "Project Touchlight")
                 draw_instruction(
                     debug_frame,
-                    f"Cursor: ({int(smoothed_cursor[0])}, {int(smoothed_cursor[1])})",
-                    4,
+                    "Keys: c = calibrate, r = reset calibration, q = quit",
+                    1,
+                )
+                draw_instruction(
+                    debug_frame,
+                    f"Mode: {MODE_INFO[mode]['label']} | Camera: {camera_index}",
+                    2,
+                )
+                draw_instruction(
+                    debug_frame,
+                    (
+                        f"Pinch: {'ON' if pinch_now else 'OFF'} | "
+                        f"Drag: {'ON' if mouse_dragging else 'OFF'} | "
+                        f"Gesture: {gesture_status}"
+                    ),
+                    3,
                 )
 
-            if mapped_cursor is not None:
-                h, w = debug_frame.shape[:2]
-                cursor_preview = (
-                    int((mapped_cursor[0] / screen_width) * w),
-                    int((mapped_cursor[1] / screen_height) * h),
-                )
-                cv2.circle(debug_frame, cursor_preview, 8, (0, 0, 255), -1)
+                if smoothed_cursor is not None:
+                    draw_instruction(
+                        debug_frame,
+                        f"Cursor: ({int(smoothed_cursor[0])}, {int(smoothed_cursor[1])})",
+                        4,
+                    )
 
-            cv2.imshow(WINDOW_NAME, debug_frame)
-            key = cv2.waitKey(1) & 0xFF
+                if mapped_cursor is not None:
+                    h, w = debug_frame.shape[:2]
+                    cursor_preview = (
+                        int((mapped_cursor[0] / screen_width) * w),
+                        int((mapped_cursor[1] / screen_height) * h),
+                    )
+                    cv2.circle(debug_frame, cursor_preview, 8, (0, 0, 255), -1)
 
-            if key == ord("q"):
-                break
-            if key == ord("c"):
-                new_calibration, timestamp_ms = run_calibration_safely(
-                    capture,
-                    landmarker,
-                    mp_draw,
-                    calibration_file,
-                    mode,
-                    timestamp_ms,
-                )
-                if new_calibration is not None:
-                    calibration = new_calibration
+                cv2.imshow(WINDOW_NAME, debug_frame)
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == ord("q"):
+                    break
+                if key == ord("c"):
+                    new_calibration, timestamp_ms = run_calibration_safely(
+                        capture,
+                        landmarker,
+                        calibration_file,
+                        mode,
+                        timestamp_ms,
+                    )
+                    if new_calibration is not None:
+                        calibration = new_calibration
+                        smoothed_cursor = None
+                        last_sent_cursor = None
+                        pinch_active = False
+                        pinch_started_time = None
+                    else:
+                        print("Calibration canceled. Continuing with the current mapping.")
+                if key == ord("r"):
+                    remove_calibration(calibration_file)
+                    print("Saved calibration removed.")
+                    calibration, timestamp_ms = run_calibration_safely(
+                        capture,
+                        landmarker,
+                        calibration_file,
+                        mode,
+                        timestamp_ms,
+                    )
                     smoothed_cursor = None
                     last_sent_cursor = None
                     pinch_active = False
                     pinch_started_time = None
-                else:
-                    print("Calibration canceled. Continuing with the current mapping.")
-            if key == ord("r"):
-                remove_calibration(calibration_file)
-                print("Saved calibration removed.")
-                calibration, timestamp_ms = run_calibration_safely(
-                    capture,
-                    landmarker,
-                    mp_draw,
-                    calibration_file,
-                    mode,
-                    timestamp_ms,
-                )
-                smoothed_cursor = None
-                last_sent_cursor = None
-                pinch_active = False
-                pinch_started_time = None
-                if calibration is None:
-                    calibration = default_calibration()
-                    print("Calibration canceled. Continuing with the full-frame fallback mapping.")
-
-    if mouse_dragging:
-        pyautogui.mouseUp()
-    capture.release()
-    cv2.destroyAllWindows()
+                    if calibration is None:
+                        calibration = default_calibration()
+                        print(
+                            "Calibration canceled. Continuing with the "
+                            "full-frame fallback mapping."
+                        )
+    finally:
+        if mouse_dragging:
+            pyautogui.mouseUp()
+        capture.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nShutdown by user.")
+    except CameraUnavailableError as exc:
+        print(f"\nCamera setup issue: {exc}")
+    except Exception as exc:
+        print(f"\nCrash: {type(exc).__name__}: {exc}")
+        print("\nFull traceback:")
+        traceback.print_exc()
+        sys.exit(1)

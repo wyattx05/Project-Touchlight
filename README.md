@@ -2,16 +2,20 @@
 
 ## Overview
 
-Project Touchlight is a gesture-based control system that transforms your camera into an intuitive input device. Use hand gestures to control your Mac with precision and ease.
+Project Touchlight is a gesture-based control system that turns your camera into an
+intuitive input device. Use hand gestures to control your Mac with precision and ease.
 
-> **⚠️ Beta Status**: This project is currently in beta. Features and functionality may change.
+> **Beta status**: This project is currently in beta. Features and functionality may change.
 
 ## Features
 
 - **Hand Gesture Recognition**: Uses MediaPipe for accurate hand landmark detection
 - **Two Control Modes**:
-  - **Continuity Camera Touchscreen**: Use your iPhone camera as a low-latency gesture-driven touchscreen
-  - **MacBook Air-Mouse**: Use your built-in camera to move the cursor with your finger and pinch to click
+  - **Continuity Camera Touchscreen**: Use your iPhone camera as a low-latency
+    gesture-driven touchscreen
+  - **MacBook Air-Mouse**: Use your built-in camera to move the cursor with your
+    finger, pinch to click, and use trackpad-like gestures to switch desktops or
+    open Mission Control.
 - **Customizable Calibration**: Calibrate the gesture zone to your camera setup for optimal accuracy
 - **Smooth Cursor Control**: Exponential moving average smoothing for fluid mouse movement
 
@@ -37,7 +41,7 @@ Project Touchlight is a gesture-based control system that transforms your camera
    ```
 
 4. Grant Accessibility permissions:
-   - Go to **System Settings** → **Privacy & Security** → **Accessibility**
+   - Go to **System Settings** -> **Privacy & Security** -> **Accessibility**
    - Add your terminal application or Python to the list
 
 ## Usage
@@ -59,7 +63,6 @@ While running:
 ## Tips
 
 - For Continuity Camera mode, USB connection is preferred for lower latency
-- Calibration improves accuracy - run it once after setup
+- Calibration improves accuracy. Run it once after setup
 - Ensure good lighting for optimal hand detection
 - Keep your hand within the camera frame for consistent tracking
-
