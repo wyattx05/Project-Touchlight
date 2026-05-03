@@ -66,3 +66,7 @@ While running:
 - Calibration improves accuracy. Run it once after setup
 - Ensure good lighting for optimal hand detection
 - Keep your hand within the camera frame for consistent tracking
+
+## Example
+
+![Example Usage](example.png)
